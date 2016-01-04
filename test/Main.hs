@@ -67,9 +67,6 @@ testElements =
      it "no closing"
         (renderText (p_ (input_ [])) ==
          "<p><input></p>")
-     it "no closing"
-        (renderText (makeXmlElementNoEnd "p") ==
-         "<p/>")
 
 -- | Test that attribute assigning works properly.
 testAttributes :: Spec

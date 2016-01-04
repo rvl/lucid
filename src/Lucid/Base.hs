@@ -14,6 +14,7 @@ module Lucid.Base
   ,renderTextT
   ,renderBST
   ,renderToFile
+  ,renderTree
    -- * Running
   ,execHtmlT
   ,evalHtmlT
@@ -21,12 +22,13 @@ module Lucid.Base
   -- * Combinators
   ,makeElement
   ,makeElementNoEnd
-  ,makeXmlElementNoEnd
   ,makeAttribute
    -- * Types
   ,Html
   ,HtmlT(HtmlT)
   ,Attribute(..)
+  ,XmlTree(..)
+  ,XNode(..)
    -- * Classes
   ,Term(..)
   ,TermRaw(..)
@@ -54,6 +56,19 @@ import qualified Data.Text.Lazy as LT
 import qualified Data.Text.Lazy.Encoding as LT
 import           Data.Typeable (Typeable)
 
+----------------------------------------------------------------------------
+-- Tree representation
+-- This was ripped out of Text.XML.HXT.DOM.TypeDefs and simplified.
+
+data XNode    = XText Text            -- plain text node
+              | XTag QName XmlTrees   -- element name and list of attributes
+              | XAttr QName           -- attribute name, value stored in children
+              deriving (Show, Eq)
+type QName    = Text
+data XmlTree = XmlTree XNode XmlTrees -- rose tree
+  deriving (Show, Eq)
+type XmlTrees = [XmlTree]
+
 --------------------------------------------------------------------------------
 -- Types
 
@@ -74,7 +89,7 @@ type Html = HtmlT Identity
 -- | A monad transformer that generates HTML. Use the simpler 'Html'
 -- type if you don't want to transform over some other monad.
 newtype HtmlT m a =
-  HtmlT {runHtmlT :: m (HashMap Text Text -> Builder,a)
+  HtmlT {runHtmlT :: m (HashMap Text Text -> XmlTrees,a)
          -- ^ This is the low-level way to run the HTML transformer,
          -- finally returning an element builder and a value. You can
          -- pass 'mempty' for this argument for a top-level call. See
@@ -152,8 +167,12 @@ instance ToHtml LT.Text where
 
 -- | Create an 'HtmlT' directly from a 'Builder'.
 build :: Monad m => Builder -> HtmlT m ()
-build b = HtmlT (return (const b,()))
+build b = HtmlT (return (const (cvrt b),()))
 {-# INLINE build #-}
+
+cvrt :: Builder -> XmlTrees
+cvrt b = [XmlTree (XText (text b)) []]
+  where text = LT.toStrict . LT.decodeUtf8 . Blaze.toLazyByteString
 
 -- | Used to construct HTML terms.
 --
@@ -273,7 +292,7 @@ unionArgs = M.unionWith (<>)
 -- you're interested in the lower-level behaviour.
 --
 renderToFile :: FilePath -> Html a -> IO ()
-renderToFile fp = L.writeFile fp . Blaze.toLazyByteString . runIdentity . execHtmlT
+renderToFile fp = L.writeFile fp . renderLazyByteString . runIdentity . execHtmlT
 
 -- | Render the HTML to a lazy 'ByteString'.
 --
@@ -282,7 +301,7 @@ renderToFile fp = L.writeFile fp . Blaze.toLazyByteString . runIdentity . execHt
 -- you're interested in the lower-level behaviour.
 --
 renderBS :: Html a -> ByteString
-renderBS = Blaze.toLazyByteString . runIdentity . execHtmlT
+renderBS = renderLazyByteString . runIdentity . execHtmlT
 
 -- | Render the HTML to a lazy 'Text'.
 --
@@ -292,7 +311,7 @@ renderBS = Blaze.toLazyByteString . runIdentity . execHtmlT
 -- lower-level behaviour.
 --
 renderText :: Html a -> LT.Text
-renderText = LT.decodeUtf8 . Blaze.toLazyByteString . runIdentity . execHtmlT
+renderText = LT.decodeUtf8 . renderLazyByteString . runIdentity . execHtmlT
 
 -- | Render the HTML to a lazy 'ByteString', but in a monad.
 --
@@ -301,7 +320,7 @@ renderText = LT.decodeUtf8 . Blaze.toLazyByteString . runIdentity . execHtmlT
 -- the lower-level behaviour.
 --
 renderBST :: Monad m => HtmlT m a -> m ByteString
-renderBST = liftM Blaze.toLazyByteString . execHtmlT
+renderBST = liftM renderLazyByteString . execHtmlT
 
 -- | Render the HTML to a lazy 'Text', but in a monad.
 --
@@ -310,7 +329,13 @@ renderBST = liftM Blaze.toLazyByteString . execHtmlT
 -- you're interested in the lower-level behaviour.
 --
 renderTextT :: Monad m => HtmlT m a -> m LT.Text
-renderTextT = liftM (LT.decodeUtf8 . Blaze.toLazyByteString) . execHtmlT
+renderTextT = liftM (LT.decodeUtf8 . renderLazyByteString) . execHtmlT
+
+renderLazyByteString :: XmlTrees -> ByteString
+renderLazyByteString = Blaze.toLazyByteString . toBlaze
+
+renderTree :: Html a -> XmlTree
+renderTree = head . runIdentity . execHtmlT
 
 --------------------------------------------------------------------------------
 -- Running, transformer versions
@@ -322,7 +347,7 @@ renderTextT = liftM (LT.decodeUtf8 . Blaze.toLazyByteString) . execHtmlT
 -- 'renderText' or 'renderBS'.
 execHtmlT :: Monad m
           => HtmlT m a  -- ^ The HTML to generate.
-          -> m Builder  -- ^ The @a@ is discarded.
+          -> m XmlTrees  -- ^ The @a@ is discarded.
 execHtmlT m =
   do (f,_) <- runHtmlT m
      return (f mempty)
@@ -353,7 +378,11 @@ makeAttribute :: Text -- ^ Attribute name.
               -> Attribute
 makeAttribute x y = Attribute x y
 
--- | Make an HTML builder.
+
+
+----------------------------------------------------------------------------
+-- building
+
 makeElement :: Monad m
             => Text       -- ^ Name.
             -> HtmlT m a  -- ^ Children HTML.
@@ -361,38 +390,22 @@ makeElement :: Monad m
 makeElement name =
   \m' ->
     HtmlT (do ~(f,a) <- runHtmlT m'
-              return (\attr  -> s "<" <> Blaze.fromText name
-                              <> foldlMapWithKey buildAttr attr <> s ">"
-                              <> f mempty
-                              <> s "</" <> Blaze.fromText name <> s ">",
-                      a))
+              return (\attr -> makeTagTree name attr (f mempty), a))
 
--- | Make an HTML builder for elements which have no ending tag.
 makeElementNoEnd :: Monad m
                  => Text       -- ^ Name.
                  -> HtmlT m () -- ^ A parent element.
 makeElementNoEnd name =
-  HtmlT (return (\attr -> s "<" <> Blaze.fromText name
-                          <> foldlMapWithKey buildAttr attr <> s ">",
-                 ()))
+  HtmlT (return (\attr -> makeTagTree name attr [], ()))
 
--- | Make an XML builder for elements which have no ending tag.
-makeXmlElementNoEnd :: Monad m
-                    => Text       -- ^ Name.
-                    -> HtmlT m () -- ^ A parent element.
-makeXmlElementNoEnd name =
-  HtmlT (return (\attr -> s "<" <> Blaze.fromText name
-                          <> foldlMapWithKey buildAttr attr <> s "/>",
-                 ()))
+makeTagTree :: Text -> HashMap Text Text -> XmlTrees -> XmlTrees
+makeTagTree name attr cs = [XmlTree (XTag name (foldlMapWithKey buildAttr attr)) cs]
 
--- | Build and encode an attribute.
-buildAttr :: Text -> Text -> Builder
-buildAttr key val =
-  s " " <>
-  Blaze.fromText key <>
-  if val == mempty
-     then mempty
-     else s "=\"" <> Blaze.fromHtmlEscapedText val <> s "\""
+-- | Build and encode single attribute into xml tree node.
+buildAttr :: Text -> Text -> XmlTrees
+buildAttr key val = [XmlTree (XAttr key) [XmlTree (XText (esc val)) []]]
+  where esc = LT.toStrict . LT.decodeUtf8
+          . Blaze.toLazyByteString . Blaze.fromHtmlEscapedText
 
 -- | Folding and monoidally appending attributes.
 foldlMapWithKey :: Monoid m => (k -> v -> m) -> HashMap k v -> m
@@ -402,3 +415,23 @@ foldlMapWithKey f = M.foldlWithKey' (\m k v -> m <> f k v) mempty
 s :: String -> Builder
 s = Blaze.fromString
 {-# INLINE s #-}
+
+toBlaze :: XmlTrees -> Builder
+toBlaze = mconcat . fmap build
+  where
+    build :: XmlTree -> Builder
+    build (XmlTree (XText t) _) = Blaze.fromText t
+    build (XmlTree (XAttr key) val) =
+      s " " <>
+      Blaze.fromText key <>
+      if val == mempty
+        then mempty
+        else s "=\"" <> (toBlaze val) <> s "\""
+    build (XmlTree (XTag name as) []) =
+      s "<" <> Blaze.fromText name
+      <> toBlaze as <> s ">"
+    build (XmlTree (XTag name as) xs) =
+      s "<" <> Blaze.fromText name
+      <> toBlaze as <> s ">"
+      <> toBlaze xs
+      <> s "</" <> Blaze.fromText name <> s ">"
